@@ -1,0 +1,5 @@
+FROM <%= mongo_version %>-base
+
+EXPOSE 27017
+RUN mkdir -p /data/db
+CMD ["mongod", "--bind_ip_all", "--replSet", "rs0"]
