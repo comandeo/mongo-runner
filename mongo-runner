@@ -1,0 +1,173 @@
+#!/usr/bin/env ruby
+require 'docker-api'
+require 'erb'
+require 'ostruct'
+require 'pp'
+require './config'
+
+DEFAULT_PORT = 27017
+
+class Mode
+  STANDALONE = 'standalone'
+  REPLICA_SET = 'replicaset'
+end
+
+def ensure_network(config)
+  if config['network_id'].nil?
+    puts "Creating docker network"
+    Docker::Network.create('mongo-runner').tap do |n|
+      config['network_id'] = n.id
+    end
+  else
+    Docker::Network.get(config['network_id'])
+  end
+end
+
+def build_image(mongo_version, image_type, bindings)
+  image_repo = "#{mongo_version}-#{image_type}"
+  puts "Building image #{image_repo}"
+  template = File.read("./templates/Dockerfile-#{image_type}.erb")
+  dockerfile = ERB.new(template).result(bindings)
+  image = Docker::Image.build(dockerfile)
+  image.tag('repo' => image_repo)
+  puts "Image #{image_repo} built"
+end
+
+def ensure_image(mongo_version, image_type)
+  image_repo = "#{mongo_version}-#{image_type}"
+  if Docker::Image.exist?(image_repo)
+    puts "Image #{image_repo} exists"
+  else
+    bindings = OpenStruct.new(mongo_version: mongo_version).instance_eval { binding }
+    build_image(mongo_version, "base", bindings) unless Docker::Image.exist?("#{mongo_version}-base")
+    build_image(mongo_version, image_type, bindings)
+  end
+  image_repo
+end
+
+def run_standalone(mongo_version, network, config)
+  puts "Starting mongo version #{mongo_version} in standalone mode"
+  image_repo = ensure_image(mongo_version, Mode::STANDALONE)
+  puts "Starting docker image #{image_repo}"
+  c = Docker::Container.create(
+    'Image' => image_repo,
+    'HostConfig' => {
+      'PortBindings' => {
+        "#{DEFAULT_PORT}/tcp" => [{ 'HostPort' => DEFAULT_PORT.to_s }]
+      }
+    }
+  )
+  c.start
+  network.connect(c.id)
+  config['mode'] = Mode::STANDALONE
+  config[Mode::STANDALONE] = {
+    'container_id' => c.id
+  }
+  config
+end
+
+def run_replicaset(mongo_version, network, config)
+  puts "Starting mongo version #{mongo_version} in replica set mode"
+  image_repo = ensure_image(mongo_version, Mode::REPLICA_SET)
+
+  containers = 0.upto(2).map do |i|
+    c = Docker::Container.create(
+      'name' => "mongo-#{i}",
+      'Image' => image_repo,
+      'HostConfig' => {
+        'PortBindings' => {
+          "#{DEFAULT_PORT}/tcp" => [{ 'HostPort' => "#{DEFAULT_PORT + i}" }]
+        }
+      }
+    )
+    c.start
+    network.connect(c.id)
+    c
+  end
+  containers.first.store_file(
+    "/replicaSet.js",
+<<x
+config = {
+  	"_id" : "rs0",
+  	"members" : [
+  		{
+  			"_id" : 0,
+  			"host" : "mongo-0:27017"
+  		},
+  		{
+  			"_id" : 1,
+  			"host" : "mongo-1:27017"
+  		},
+  		{
+  			"_id" : 2,
+  			"host" : "mongo-2:27017"
+  		}
+  	]
+  }
+rs.initiate(config)
+x
+  )
+  containers.first.exec(%w[mongo localhost:27017/test /replicaSet.js])
+  config['mode'] = Mode::REPLICA_SET
+  config[Mode::REPLICA_SET] = {
+    'container_ids' => containers.map(&:id)
+  }
+  config
+end
+
+def stop(config)
+  case config.delete('mode')
+  when Mode::STANDALONE
+    container = Docker::Container.get(config[Mode::STANDALONE]['container_id'])
+    container.stop
+    container.delete
+    config.delete(Mode::STANDALONE)
+  when Mode::REPLICA_SET
+    config[Mode::REPLICA_SET]['container_ids'].each do |id|
+      container = Docker::Container.get(id)
+      container.stop
+      container.delete
+    end
+    config.delete(Mode::REPLICA_SET)
+  end
+  config
+end
+
+Config.with_config do |config|
+  action = ARGV[0]
+
+  if action.nil?
+    puts "Please specify an action"
+    exit(-1)
+  end
+
+  case action
+  when 'show'
+    pp config
+  when 'stop'
+    puts "Stopping running configuration"
+    Config.save(stop(config))
+  when 'start'
+    mongo_version = ARGV[1]
+    if mongo_version.nil?
+      puts "Please specify a version"
+      return
+    end
+    mongo_mode = ARGV[2]
+    if mongo_mode.nil?
+      puts "Please specify a mode"
+      return
+    end
+    network = ensure_network(config)
+    case mongo_mode
+    when Mode::STANDALONE
+      run_standalone(mongo_version, network, config)
+    when Mode::REPLICA_SET
+      run_replicaset(mongo_version, network, config)
+    else
+      puts "Unknown mode"
+    end
+  else
+    puts "Unknown action"
+  end
+end
