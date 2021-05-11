@@ -2,10 +2,12 @@
 require 'docker-api'
 require 'erb'
 require 'ostruct'
-require 'pp'
+require 'pretty_console_output'
 require './config'
 
 DEFAULT_PORT = 27017
+
+CONSOLE = PrettyConsoleOutput::Console.new
 
 class Mode
   STANDALONE = 'standalone'
@@ -14,10 +16,11 @@ end
 
 def ensure_network(config)
   if config['network_id'].nil?
-    puts "Creating docker network"
+    CONSOLE.info "No docker network found, creating one"
     Docker::Network.create('mongo-runner').tap do |n|
       config['network_id'] = n.id
     end
+    CONSOLE.done "Network created"
   else
     Docker::Network.get(config['network_id'])
   end
@@ -25,18 +28,18 @@ end
 
 def build_image(mongo_version, image_type, bindings)
   image_repo = "#{mongo_version}-#{image_type}"
-  puts "Building image #{image_repo}"
+  CONSOLE.info "Building image #{image_repo}"
   template = File.read("./templates/Dockerfile-#{image_type}.erb")
   dockerfile = ERB.new(template).result(bindings)
   image = Docker::Image.build(dockerfile)
   image.tag('repo' => image_repo)
-  puts "Image #{image_repo} built"
+  CONSOLE.done "Image #{image_repo} built"
 end
 
 def ensure_image(mongo_version, image_type)
   image_repo = "#{mongo_version}-#{image_type}"
   if Docker::Image.exist?(image_repo)
-    puts "Image #{image_repo} exists"
+    CONSOLE.done "Image #{image_repo} exists"
   else
     bindings = OpenStruct.new(mongo_version: mongo_version).instance_eval { binding }
     build_image(mongo_version, "base", bindings) unless Docker::Image.exist?("#{mongo_version}-base")
@@ -46,9 +49,9 @@ def ensure_image(mongo_version, image_type)
 end
 
 def run_standalone(mongo_version, network, config)
-  puts "Starting mongo version #{mongo_version} in standalone mode"
+  CONSOLE.tag "Starting mongo version #{mongo_version} in standalone mode"
   image_repo = ensure_image(mongo_version, Mode::STANDALONE)
-  puts "Starting docker image #{image_repo}"
+  CONSOLE.info "Starting docker image #{image_repo}"
   c = Docker::Container.create(
     'Image' => image_repo,
     'HostConfig' => {
@@ -58,6 +61,7 @@ def run_standalone(mongo_version, network, config)
     }
   )
   c.start
+  CONSOLE.done "Standalone #{mongo_version} is running"
   network.connect(c.id)
   config['mode'] = Mode::STANDALONE
   config[Mode::STANDALONE] = {
@@ -67,9 +71,9 @@ def run_standalone(mongo_version, network, config)
 end
 
 def run_replicaset(mongo_version, network, config)
-  puts "Starting mongo version #{mongo_version} in replica set mode"
+  CONSOLE.tag "Starting mongo version #{mongo_version} in replica set mode"
   image_repo = ensure_image(mongo_version, Mode::REPLICA_SET)
-
+  CONSOLE.info "Starting docker images #{image_repo}"
   containers = 0.upto(2).map do |i|
     c = Docker::Container.create(
       'name' => "mongo-#{i}",
@@ -108,6 +112,7 @@ rs.initiate(config)
 x
   )
   containers.first.exec(%w[mongo localhost:27017/test /replicaSet.js])
+  CONSOLE.done "Replica set #{mongo_version} is running"
   config['mode'] = Mode::REPLICA_SET
   config[Mode::REPLICA_SET] = {
     'container_ids' => containers.map(&:id)
@@ -116,6 +121,7 @@ x
 end
 
 def stop(config)
+  CONSOLE.tag "Stopping running configuration"
   case config.delete('mode')
   when Mode::STANDALONE
     container = Docker::Container.get(config[Mode::STANDALONE]['container_id'])
@@ -129,33 +135,35 @@ def stop(config)
       container.delete
     end
     config.delete(Mode::REPLICA_SET)
+  else
+    CONSOLE.done "Nothing runs, nothing to stop"
+    return
   end
-  config
+  CONSOLE.done "All stopped"
 end
 
 Config.with_config do |config|
   action = ARGV[0]
 
   if action.nil?
-    puts "Please specify an action"
+    CONSOLE.error "Please specify an action"
     exit(-1)
   end
 
   case action
   when 'show'
-    pp config
+    CONSOLE.data config.to_yaml
   when 'stop'
-    puts "Stopping running configuration"
     Config.save(stop(config))
   when 'start'
     mongo_version = ARGV[1]
     if mongo_version.nil?
-      puts "Please specify a version"
+      CONSOLE.error "Please specify a version"
       return
     end
     mongo_mode = ARGV[2]
     if mongo_mode.nil?
-      puts "Please specify a mode"
+      CONSOLE.error "Please specify a mode"
       return
     end
     network = ensure_network(config)
@@ -165,9 +173,9 @@ Config.with_config do |config|
     when Mode::REPLICA_SET
       run_replicaset(mongo_version, network, config)
     else
-      puts "Unknown mode"
+      CONSOLE.error "Unknown mode"
     end
   else
-    puts "Unknown action"
+    CONSOLE.error "Unknown action"
   end
 end

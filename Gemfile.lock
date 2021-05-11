@@ -6,12 +6,14 @@ GEM
       multi_json
     excon (0.81.0)
     multi_json (1.15.0)
+    pretty_console_output (1.0.0)
 
 PLATFORMS
   x86_64-darwin-19
 
 DEPENDENCIES
   docker-api
+  pretty_console_output
 
 BUNDLED WITH
    2.2.16
