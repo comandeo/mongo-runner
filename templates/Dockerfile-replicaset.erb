@@ -1,5 +1,4 @@
 FROM <%= mongo_version %>-base
 
-EXPOSE 27017
 RUN mkdir -p /data/db
-CMD ["mongod", "--bind_ip_all", "--replSet", "rs0"]
+CMD ["sh", "-c", "mongod --replSet rs0 --port ${MONGOD_PORT} --bind_ip_all --setParameter enableTestCommands=1"]

@@ -3,6 +3,8 @@ require 'docker-api'
 require 'erb'
 require 'ostruct'
 require 'pretty_console_output'
+require 'json'
+require 'socket'
 require './config'
 
 DEFAULT_PORT = 27017
@@ -14,13 +16,17 @@ class Mode
   REPLICA_SET = 'replicaset'
 end
 
+def get_local_ip
+  IPSocket.getaddress(Socket.gethostname)
+end
+
 def ensure_network(config)
   if config['network_id'].nil?
     CONSOLE.info "No docker network found, creating one"
     Docker::Network.create('mongo-runner').tap do |n|
       config['network_id'] = n.id
+      CONSOLE.done "Network created"
     end
-    CONSOLE.done "Network created"
   else
     Docker::Network.get(config['network_id'])
   end
@@ -74,42 +80,38 @@ def run_replicaset(mongo_version, network, config)
   CONSOLE.tag "Starting mongo version #{mongo_version} in replica set mode"
   image_repo = ensure_image(mongo_version, Mode::REPLICA_SET)
   CONSOLE.info "Starting docker images #{image_repo}"
+  members = []
   containers = 0.upto(2).map do |i|
+    name = "mongo-#{i}"
+    port = DEFAULT_PORT + i
+    CONSOLE.info "Starting mongod on port #{port}"
     c = Docker::Container.create(
-      'name' => "mongo-#{i}",
+      'name' => name,
       'Image' => image_repo,
+      "ExposedPorts": {
+        "#{port}/tcp": { }
+      },
       'HostConfig' => {
         'PortBindings' => {
-          "#{DEFAULT_PORT}/tcp" => [{ 'HostPort' => "#{DEFAULT_PORT + i}" }]
+          "#{port}/tcp" => [{ 'HostPort' => "#{port}" }]
         }
-      }
+      },
+      'Env' => [
+        "MONGOD_PORT=#{port}"
+      ]
     )
     c.start
     network.connect(c.id)
+    members << {'_id' => i, 'host' => "#{get_local_ip}:#{port}"}
     c
   end
+  rsconf = {
+    '_id': 'rs0',
+    'members': members
+  }
   containers.first.store_file(
     "/replicaSet.js",
-<<x
-config = {
-  	"_id" : "rs0",
-  	"members" : [
-  		{
-  			"_id" : 0,
-  			"host" : "mongo-0:27017"
-  		},
-  		{
-  			"_id" : 1,
-  			"host" : "mongo-1:27017"
-  		},
-  		{
-  			"_id" : 2,
-  			"host" : "mongo-2:27017"
-  		}
-  	]
-  }
-rs.initiate(config)
-x
+    "rsconf = #{rsconf.to_json}; rs.initiate(rsconf)"
   )
   containers.first.exec(%w[mongo localhost:27017/test /replicaSet.js])
   CONSOLE.done "Replica set #{mongo_version} is running"
